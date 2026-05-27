@@ -1,188 +1,395 @@
+import os
+import random
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import numpy as np
+from PIL import Image
+from PIL import ImageFilter
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader, Dataset
 
 from model import CNN
 
-# Hyper-parameters
-NUM_EPOCHS   = 30 # fixed
-BATCH_SIZE   = 32 
-LEARNING_RATE = 1.0e-3
-VAL_FRACTION  = 0.1          # 10 % of trainval used for validation
-NUM_CLASSES   = 37
-IMG_SIZE      = 128   ## changed from 128
-SEED          = 5  #doesn't really matter
-MODEL_SAVE_PATH_BEST  = "best_model.pth"
+# Hyperparameters
+
+
+NUM_EPOCHS= 30
+BATCH_SIZE= 64
+LEARNING_RATE= 6e-4
+NUM_CLASSES = 37
+IMG_SIZE  = 224
+#VAL_SIZE = 0.1
+SEED= 5
+MODEL_SAVE_PATH_BEST = "best_model.pth"
 MODEL_SAVE_PATH_FINAL = "final_model.pth"
 
+USE_TRIMAP = True   # 4th input channel
+
 torch.manual_seed(SEED)
+random.seed(SEED)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
-# Transforms
-train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2), #need to change or add more, too much overfitting rn
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+#paths
 
-val_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]), # default apparantly
-])
+DATA_ROOT   = "./data/oxford-iiit-pet"
+IMAGES_DIR  = os.path.join(DATA_ROOT, "images")
+ANNOTS_DIR  = os.path.join(DATA_ROOT, "annotations") # works dnot change
+TRIMAPS_DIR = os.path.join(ANNOTS_DIR, "trimaps")
 
 
-# Dataset & DataLoaders
-full_trainval = datasets.OxfordIIITPet(
-    root="./data",
-    split="trainval",
-    target_types="category",
-    download=True,
-    transform=train_transform,      # augmented transform for now
+#transforms
+
+#needed major changing to allow for tranforms for trimap and image together
+#this only applies geometric transofrms for both rgb and trimap and other transforms only for rgb
+class JointTrainTransform:
+
+
+    def __init__(self, img_size):
+        self.img_size = img_size
+
+    def __call__(self, img, trimap):
+
+        i, j, h, w = transforms.RandomResizedCrop.get_params(img,scale=(0.7, 1.0),ratio=(0.75, 1.33),)
+
+        img = TF.resized_crop(
+            img,i,j, h, w,(self.img_size, self.img_size),interpolation=Image.BILINEAR,) # image bilinear for smoothness
+        #copy for trimap
+        trimap = TF.resized_crop(trimap,i, j, h, w,(self.img_size, self.img_size),interpolation=Image.NEAREST,) # image nearest for trimap because its discrete
+
+        #horizontal flip
+        if random.random() < 0.5:
+            img = TF.hflip(img)
+            trimap = TF.hflip(trimap) 
+            #only geometric transforms need to be applied to both
+        
+        #grayscale
+
+        if random.random() < 0.1:
+          img = TF.rgb_to_grayscale(img, num_output_channels=3)
+          
+
+        #blur
+
+        if random.random() < 0.15: # increase?
+          img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 1.2)))
+
+        #rotation 
+        angle = random.uniform(-20, 20) #15 optimal?
+
+        img = TF.rotate(
+            img,
+            angle,
+            interpolation=Image.BILINEAR,#bilinear for smoothness
+        )
+         #copy apart from interpolation
+        trimap = TF.rotate(
+            trimap,
+            angle,
+            interpolation=Image.NEAREST, #nearest for trimap because discrete, same as bilinear
+        )
+
+        #colour jitter only on RGB
+        img = transforms.ColorJitter(
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.15,hue=0.05,)(img)
+        
+
+        # RGB to tensor
+        img_tensor = TF.to_tensor(img)
+        # Normalise
+        img_tensor = TF.normalize(
+            img_tensor,
+            mean=[0.5, 0.5, 0.5],
+            std=[0.5, 0.5, 0.5],
+        ) #defualt values
+    
+        #random erasing
+        #img_tensor = transforms.RandomErasing(p=0.1)(img_tensor)
+
+    
+        #convert trimap to tensor
+
+
+        trimap_np = np.array(trimap)
+
+        mapped = np.zeros(trimap_np.shape, dtype=np.float32)
+        #heard using 1 0 -1 also works
+        mapped[trimap_np == 1] = 1.0   #foreground
+        mapped[trimap_np == 2] = 0.0   #background
+        mapped[trimap_np == 3] = 0.5   #boundary
+        trimap_tensor = torch.from_numpy(mapped).unsqueeze(0)
+
+        #combines rgb and trimap.
+        combined = torch.cat([img_tensor, trimap_tensor], dim=0)
+
+        return combined
+
+
+
+
+#validation transform
+#val_transform = transforms.Compose([
+ #   transforms.Resize((IMG_SIZE, IMG_SIZE)),
+  #  transforms.ToTensor(),
+   # transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+#])
+
+train_transform = JointTrainTransform(IMG_SIZE)
+
+
+
+
+
+
+class PetDataset(Dataset):
+    """
+    Oxford-IIIT Pet dataset with  trimap 4th channel
+    """
+
+    def __init__(self, split, img_transform, use_trimap):
+        self.use_trimap = use_trimap
+        self.img_tf = img_transform
+
+        #download
+        _base = datasets.OxfordIIITPet(
+            root="./data",
+            split=split,
+            target_types="category",
+            download=True,
+        )
+
+        self.classes = _base.classes
+
+        if split == "trainval":
+            split_filename = "trainval.txt"
+        else:
+            split_filename = "test.txt"
+        split_file= os.path.join(ANNOTS_DIR, split_filename)
+        self.samples = []
+        with open(split_file) as file: # please work
+            for line in file:
+                line = line.strip()
+
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                name=parts[0] 
+
+                label = int(parts[1]) - 1 #1 indexed to 0 indexed
+                self.samples.append((name, label))
+
+    def __len__(self): #neccessary 
+        return len(self.samples)
+
+    def __getitem__(self, index):
+
+        name, label = self.samples[index]
+
+        img = Image.open(
+            os.path.join(IMAGES_DIR, name + ".jpg")).convert("RGB")
+
+
+        #trimap        
+        if self.use_trimap:
+            trimap_path = os.path.join(TRIMAPS_DIR, name + ".png")
+
+            #if os.path.exists(trimap_path):
+            trimap = Image.open(trimap_path)
+            img_tensor=self.img_tf(img,trimap)
+
+        #if not usig trimap
+        else:
+            img_tensor = self.img_tf(img)
+        return img_tensor, label
+
+
+
+# Datasets & DataLoaders
+
+train_dataset = PetDataset(
+    "trainval",
+    train_transform,
+    use_trimap=USE_TRIMAP,
 )
 
-# Split into train val subsets
-val_size   = int(len(full_trainval) * VAL_FRACTION)
-train_size = len(full_trainval) - val_size
-train_subset, val_subset = random_split(
-    full_trainval, [train_size, val_size],
-    generator=torch.Generator().manual_seed(SEED)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True,
 )
 
-# Apply the plain transform to the val subset
+print(f"Train samples: {len(train_dataset)}")
 
-val_dataset_raw = datasets.OxfordIIITPet(
-    root="./data",
-    split="trainval",
-    target_types="category",
-    download=False,
-    transform=val_transform,
+
+
+#model
+
+in_channels = 4 if USE_TRIMAP else 3
+
+model = CNN(
+    num_classes=NUM_CLASSES,
+    in_channels=in_channels,
+).to(device)
+
+#loss
+
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+#optimiser
+#adamw better than adam?
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=5e-4, #dont change
 )
-# Use the same indices from the random split
-val_subset_clean = torch.utils.data.Subset(val_dataset_raw, val_subset.indices)
+#schedule. cosine?
 
-train_loader = DataLoader(train_subset,       batch_size=BATCH_SIZE, shuffle=True,  num_workers=0, pin_memory=False)
-val_loader   = DataLoader(val_subset_clean,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=LEARNING_RATE,
+    steps_per_epoch=len(train_loader),
+    epochs=NUM_EPOCHS,
+)
 
-print(f"Train samples : {len(train_subset)}")
-print(f"Val   samples : {len(val_subset_clean)}")
 
 
-# Model  loss  optimiser scheduler
-model = CNN(num_classes=NUM_CLASSES).to(device)
 
-criterion = nn.CrossEntropyLoss()
+#standard training loop
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, device): 
 
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4) #maybe change weight decy
-
-# Reduce LR by 0.5 if val loss doesn't improve for 3 epochs
-#scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-#    optimizer, mode="min", factor=0.5, patience=2
-#)
-
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-#scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99) #hmm
-
-# main loop
-def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
+
     total_loss = 0.0
-    correct  = 0
+    correct = 0
     total = 0
 
     for i, (images, labels) in enumerate(loader):
-        images, labels = images.to(device), labels.to(device)
 
-        optimizer.zero_grad()
+        images = images.to(device)
+        labels = labels.to(device)
+
+        
+        optimizer.zero_grad() 
+
         outputs = model(images)
-        loss = criterion(outputs, labels) 
+
+        loss = criterion(outputs, labels)
+        #backprop
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0,
+        )
+
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item() * images.size(0)
+
         preds = outputs.argmax(dim=1)
+
         correct += (preds == labels).sum().item()
-        total +=  images.size(0)
+        total += images.size(0)
 
-        if i % 20 == 0: # every 20 very useful rmove when submitting
-            print(f"  Batch {i}/{len(loader)}  Loss: {loss.item():.4f}")
+        if i % 20 == 0:
+            print(f"  Batch {i}/{len(loader)}  Loss: {loss.item():.2f}") # prints loss
 
-    avg_loss = total_loss/ total
-    accuracy = correct / total
-    return avg_loss, accuracy
+    return total_loss / total, correct / total
 
-# validation part of training basically mini test
+"""
 def evaluate(model, loader, criterion, device):
+
     model.eval()
+
     total_loss = 0.0
     correct = 0
     total = 0
 
     with torch.no_grad():
+
         for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss    = criterion(outputs, labels)
 
-            total_loss += loss.item()* images.size(0)
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs= model(images)
+
+            loss = criterion(outputs, labels)
+
+            total_loss += loss.item() * images.size(0)
+
             preds = outputs.argmax(dim=1)
-            correct  += (preds == labels).sum().item()
-            total += images.size(0)
 
-    avg_loss = total_loss / total
-    accuracy = correct / total
-    return avg_loss, accuracy
+            correct += (preds == labels).sum().item()
+            total   += images.size(0)
+
+    return total_loss / total, correct / total
+"""
 
 
-# Training loop
-best_val_acc = 0.0
+# Main training loop
+
+best_train_acc = 0.0
 
 for epoch in range(1, NUM_EPOCHS + 1):
-    train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-    val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
-    scheduler.step()
+    train_loss, train_acc = train_one_epoch(
+        model,train_loader,criterion,optimizer, scheduler, device,)
 
-    print( # loss and acc to cry at every epoch
-        f"Epoch [{epoch:02d}/{NUM_EPOCHS}] "
-        f"Train Loss: {train_loss:.4f}  Train Acc: {train_acc*100:.2f}% |"
-        f"Val Loss: {val_loss:.4f}  Val Acc: {val_acc*100:.2f}%"
+    print(
+        f"Epoch [{epoch:02d}/{NUM_EPOCHS}]  "
+        f"Train Loss: {train_loss:.4f}  "
+        f"Train Acc: {train_acc*100:.2f}%"
     )
 
-    # Save best model
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save(model.state_dict(), MODEL_SAVE_PATH_BEST)
-        print(f"  NEW BEST MODEL SAVED (val acc {val_acc*100:.2f}%)")
+    if train_acc > best_train_acc:
 
-# Save the final model 
+        best_train_acc = train_acc
+
+        torch.save(
+            model.state_dict(),
+            MODEL_SAVE_PATH_BEST,
+        )  #saves at both bets and final 
+
+        print(f"NEW BEST saved"f"(train acc {train_acc*100:.2f}%)")
+
 torch.save(model.state_dict(), MODEL_SAVE_PATH_FINAL)
-print(f"\nTraining complete.")
-print(f"Best val accuracy : {best_val_acc*100:.2f}%")
-print(f"Models saved to '{MODEL_SAVE_PATH_BEST}' and '{MODEL_SAVE_PATH_FINAL}'")
 
+print("\nTraining complete.")
 
-# Final accuracy on the  official trainval set 
-full_trainval_eval = datasets.OxfordIIITPet(
-    root="./data",
-    split="trainval",
-    target_types="category",
-    download=False,
-    transform=val_transform,
+"""eval_dataset = PetDataset(
+    "trainval",
+    val_transform,
+    use_trimap=False,  
 )
-full_train_loader = DataLoader(full_trainval_eval, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
-# Load best weights for the end mght remove
-model.load_state_dict(torch.load(MODEL_SAVE_PATH_BEST, map_location=device))
-_, train_final_acc = evaluate(model, full_train_loader, criterion, device)
-print(f"\nFinal model accuracy on official trainval set: {train_final_acc*100:.2f}%")
+eval_loader = DataLoader(
+    eval_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=2,
+)
+
+model.load_state_dict(
+    torch.load(MODEL_SAVE_PATH_FINAL, map_location=device)
+)
+
+_, final_acc = evaluate(
+    model,
+    eval_loader,
+    criterion,
+    device,
+)
+
+print(
+    f"Final model accuracy on official trainval set: "
+    f"{final_acc*100:.2f}%"
+)"""
