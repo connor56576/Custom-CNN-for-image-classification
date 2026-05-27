@@ -19,7 +19,7 @@ BATCH_SIZE= 64
 LEARNING_RATE= 6e-4
 NUM_CLASSES = 37
 IMG_SIZE  = 224
-#VAL_SIZE = 0.1
+
 SEED= 5
 MODEL_SAVE_PATH_BEST = "best_model.pth"
 MODEL_SAVE_PATH_FINAL = "final_model.pth"
@@ -37,14 +37,12 @@ print(f"Using device: {device}")
 
 DATA_ROOT   = "./data/oxford-iiit-pet"
 IMAGES_DIR  = os.path.join(DATA_ROOT, "images")
-ANNOTS_DIR  = os.path.join(DATA_ROOT, "annotations") # works dnot change
+ANNOTS_DIR  = os.path.join(DATA_ROOT, "annotations")
 TRIMAPS_DIR = os.path.join(ANNOTS_DIR, "trimaps")
 
 
 #transforms
 
-#needed major changing to allow for tranforms for trimap and image together
-#this only applies geometric transofrms for both rgb and trimap and other transforms only for rgb
 class JointTrainTransform:
 
 
@@ -74,11 +72,11 @@ class JointTrainTransform:
 
         #blur
 
-        if random.random() < 0.15: # increase?
+        if random.random() < 0.15: # 
           img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 1.2)))
 
         #rotation 
-        angle = random.uniform(-20, 20) #15 optimal?
+        angle = random.uniform(-20, 20) #
 
         img = TF.rotate(
             img,
@@ -108,9 +106,6 @@ class JointTrainTransform:
             std=[0.5, 0.5, 0.5],
         ) #defualt values
     
-        #random erasing
-        #img_tensor = transforms.RandomErasing(p=0.1)(img_tensor)
-
     
         #convert trimap to tensor
 
@@ -130,14 +125,6 @@ class JointTrainTransform:
         return combined
 
 
-
-
-#validation transform
-#val_transform = transforms.Compose([
- #   transforms.Resize((IMG_SIZE, IMG_SIZE)),
-  #  transforms.ToTensor(),
-   # transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-#])
 
 train_transform = JointTrainTransform(IMG_SIZE)
 
@@ -171,7 +158,7 @@ class PetDataset(Dataset):
             split_filename = "test.txt"
         split_file= os.path.join(ANNOTS_DIR, split_filename)
         self.samples = []
-        with open(split_file) as file: # please work
+        with open(split_file) as file: 
             for line in file:
                 line = line.strip()
 
@@ -183,7 +170,7 @@ class PetDataset(Dataset):
                 label = int(parts[1]) - 1 #1 indexed to 0 indexed
                 self.samples.append((name, label))
 
-    def __len__(self): #neccessary 
+    def __len__(self): 
         return len(self.samples)
 
     def __getitem__(self, index):
@@ -247,9 +234,9 @@ criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr=LEARNING_RATE,
-    weight_decay=5e-4, #dont change
+    weight_decay=5e-4, 
 )
-#schedule. cosine?
+
 
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
@@ -304,37 +291,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device):
 
     return total_loss / total, correct / total
 
-"""
-def evaluate(model, loader, criterion, device):
-
-    model.eval()
-
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-
-        for images, labels in loader:
-
-            images = images.to(device)
-            labels = labels.to(device)
-
-            outputs= model(images)
-
-            loss = criterion(outputs, labels)
-
-            total_loss += loss.item() * images.size(0)
-
-            preds = outputs.argmax(dim=1)
-
-            correct += (preds == labels).sum().item()
-            total   += images.size(0)
-
-    return total_loss / total, correct / total
-"""
-
-
 # Main training loop
 
 best_train_acc = 0.0
@@ -357,39 +313,10 @@ for epoch in range(1, NUM_EPOCHS + 1):
         torch.save(
             model.state_dict(),
             MODEL_SAVE_PATH_BEST,
-        )  #saves at both bets and final 
+        )  #saves at both best and final 
 
         print(f"NEW BEST saved"f"(train acc {train_acc*100:.2f}%)")
 
 torch.save(model.state_dict(), MODEL_SAVE_PATH_FINAL)
 
 print("\nTraining complete.")
-
-"""eval_dataset = PetDataset(
-    "trainval",
-    val_transform,
-    use_trimap=False,  
-)
-
-eval_loader = DataLoader(
-    eval_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=2,
-)
-
-model.load_state_dict(
-    torch.load(MODEL_SAVE_PATH_FINAL, map_location=device)
-)
-
-_, final_acc = evaluate(
-    model,
-    eval_loader,
-    criterion,
-    device,
-)
-
-print(
-    f"Final model accuracy on official trainval set: "
-    f"{final_acc*100:.2f}%"
-)"""
