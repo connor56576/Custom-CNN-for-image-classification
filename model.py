@@ -62,8 +62,8 @@ class CNN(nn.Module):
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
         )
 
-        self.layer1 = self._make_layer(64,  128, 2, stride=1, drop_prob = drop_prob) #more layers
-        self.layer2 = self._make_layer(128, 256, 2, stride=2, drop_prob = drop_prob) #keep stride same for now 
+        self.layer1 = self._make_layer(64,  128, 2, stride=1, drop_prob = drop_prob) 
+        self.layer2 = self._make_layer(128, 256, 2, stride=2, drop_prob = drop_prob) 
         self.layer3 = self._make_layer(256, 512, 2, stride=2, drop_prob = drop_prob)
         self.layer4 = self._make_layer(512, 512, 2, stride=2, drop_prob = drop_prob)
 
@@ -71,7 +71,7 @@ class CNN(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)#pooling for the 512 channels
         self.fc=nn.Sequential(
             nn.Flatten(),
-            nn.Dropout(0.2), # increase?
+            nn.Dropout(0.2), #
             nn.Linear(512, num_classes),
         )
 
